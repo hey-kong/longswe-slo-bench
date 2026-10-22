@@ -2,29 +2,45 @@
 
 Search for the highest tested client concurrency satisfying **P90 TTFT < 10 s** and **mean decode TPS > 15 tokens/s**, using local LongSWE-Bench 128K data and an already running SGLang server.
 
-## Quick start
+## Setup
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then:
 
 ```bash
 git clone https://github.com/hey-kong/longswe-slo-bench.git
 cd longswe-slo-bench
-pip install -r requirements.txt
-
-# Inspect local data before benchmarking.
-python longswe_slo.py --inspect-only --output-len 1024 --output-dir unused
-
-# Start the target server separately, then run:
-python longswe_slo.py --label hicache --output-len 1024 --output-dir results/hicache
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install -r requirements.txt
 ```
 
-For other server configurations, change the label and output directory to `hisparse`, `adaptive_hisparse`, or `kvduo`. Run one configuration at a time. Output directories must not already exist.
+## Configure and run
 
-Default paths:
+Replace the placeholders with your local paths and server URL:
 
-- Dataset: `~/datasets/longswebench/LongSWE_Bench/128K`
-- Tokenizer: `/mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-0731`
-- Server: `http://127.0.0.1:32073`
+```bash
+DATASET="<local-LongSWE-Bench-128K-directory>"
+TOKENIZER="<local-model-or-tokenizer-directory>"
+BASE_URL="<SGLang-server-URL>"
+OUTPUT_DIR="<new-results-directory>"
+LABEL="hicache"
 
-Override with `--dataset`, `--tokenizer`, and `--base-url`. All data and tokenizer files are loaded locally. Use `--prompt-column` if field detection is ambiguous.
+# Inspect local data before benchmarking.
+python longswe_slo.py \
+  --dataset "$DATASET" --tokenizer "$TOKENIZER" \
+  --output-len 1024 --output-dir "$OUTPUT_DIR" --inspect-only
+
+# Start the target server separately, then benchmark it.
+python longswe_slo.py \
+  --dataset "$DATASET" --tokenizer "$TOKENIZER" --base-url "$BASE_URL" \
+  --label "$LABEL" --output-len 1024 --output-dir "$OUTPUT_DIR"
+```
+
+The dataset directory must contain the saved 128K dataset, including `dataset_dict.json` and its split directory. The server URL must include its scheme, host, and port.
+
+For other server configurations, change `LABEL` to `hisparse`, `adaptive_hisparse`, or `kvduo`, and choose a new `OUTPUT_DIR`. Run one configuration at a time. Output directories must not already exist.
+
+All data and tokenizer files are loaded locally. Use `--prompt-column` if field detection is ambiguous.
 
 ## Test settings
 
