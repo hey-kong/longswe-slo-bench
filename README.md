@@ -1,6 +1,6 @@
-# LongSWE SLO Bench
+# LongSWE / SWE SLO Bench
 
-Search for the highest tested client concurrency satisfying **P90 TTFT < 10 s** and **mean decode TPS > 15 tokens/s**, using local LongSWE-Bench 128K data and an already running SGLang server.
+Search for the highest tested client concurrency satisfying **P90 TTFT < 10 s** and **mean decode TPS > 15 tokens/s**, using local LongSWE-Bench or SWE-Bench prompts and an already running SGLang server. Both entry points share the same requests, metrics, search, and time budget.
 
 ## Setup
 
@@ -36,11 +36,34 @@ python longswe_slo.py \
   --label "$LABEL" --output-len 1024 --output-dir "$OUTPUT_DIR"
 ```
 
-The dataset directory must contain the saved 128K dataset, including `dataset_dict.json` and its split directory. The server URL must include its scheme, host, and port.
+Local inputs can be a `save_to_disk` dataset, a Parquet/JSON/JSONL file, or a downloaded dataset directory with split files such as `data/test-*.parquet`. Directory loading selects only `--split test` by default, never train/dev shards. The server URL must include its scheme, host, and port.
 
 For other server configurations, change `LABEL` to `hisparse`, `adaptive_hisparse`, or `kvduo`, and choose a new `OUTPUT_DIR`. Run one configuration at a time. Output directories must not already exist.
 
 All data and tokenizer files are loaded locally. Use `--prompt-column` if field detection is ambiguous.
+
+### SWE-Bench
+
+Use `swebench_slo.py` with the same options and server configurations:
+
+```bash
+DATASET="<local-SWE-Bench-directory-or-parquet-file>"
+OUTPUT_DIR="<new-SWE-Bench-results-directory>"
+
+python swebench_slo.py \
+  --dataset "$DATASET" --tokenizer "$TOKENIZER" \
+  --output-len 1024 --output-dir "$OUTPUT_DIR" --inspect-only
+
+python swebench_slo.py \
+  --dataset "$DATASET" --tokenizer "$TOKENIZER" --base-url "$BASE_URL" \
+  --label "$LABEL" --output-len 1024 --output-dir "$OUTPUT_DIR"
+```
+
+For the approximately 40K workload, use a locally downloaded [SWE-bench_bm25_40K](https://huggingface.co/datasets/princeton-nlp/SWE-bench_bm25_40K): its `text` column already includes the issue and retrieved code. Its 40K limit concerns code context under the source tokenizer; actual full-prompt lengths vary with the serving tokenizer.
+
+Original SWE-Bench task data, including the original ModelScope mirror, may only contain `problem_statement` and metadata, without prepared code context. Such data is rejected by default. Add `--issue-only` to **both** commands above to explicitly test issue text alone; this is a short-input workload, not SWE-Bench 40K. The mode and warning are recorded in `config.json`. Reference patches and test answers are never automatically included in prompts. No code retrieval or dataset download runs automatically.
+
+Keep SWE-Bench and LongSWE-Bench results in separate output directories. `--inspect-only` reports fields, selected input mode, source files, and local token counts before sending requests. `longswe_slo.py --dataset-kind swebench` is equivalent to the SWE-Bench entry point.
 
 ## Test settings
 
@@ -62,8 +85,9 @@ Run `python longswe_slo.py --help` for all options.
 
 ## Timing checks
 
-CPU-only mocked checks require no model, dataset, or running server:
+CPU-only tests use temporary local fixtures; no GPU or running SGLang server is required:
 
 ```bash
-python -m unittest -v test_longswe_slo.py
+python -m unittest discover -v
 ```
+
