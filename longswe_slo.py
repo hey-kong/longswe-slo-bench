@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Budgeted LongSWE-Bench concurrency search against SGLang /generate.
+"""Budgeted LongSWE-Bench / SWE-Bench concurrency search against SGLang /generate.
 
 Local dataset/tokenizer only. No model hub downloads. See --help and README.
 """
@@ -14,6 +14,7 @@ import random
 import statistics
 import time
 import uuid
+import warnings
 
 
 def percentile(values, q):
@@ -200,23 +201,86 @@ async def stage(session, args, prompts, c, seconds, kind, raw_file, run_id, dead
     return result
 
 
+def load_local_split(dataset, split):
+    """Read saved datasets or local data files without resolving a hub dataset."""
+    from datasets import Dataset, DatasetDict, load_from_disk
+
+    path = Path(dataset).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f'Local dataset does not exist: {path}')
+    if path.is_dir() and any((path / name).is_file() for name in
+                             ('dataset_dict.json', 'state.json')):
+        ds = load_from_disk(str(path))
+        if isinstance(ds, DatasetDict):
+            if split not in ds:
+                raise ValueError(f'Split {split!r} not found; available: {list(ds)}')
+            ds = ds[split]
+        return ds, dict(format='save_to_disk', path=str(path), split=split)
+
+    formats = {'.parquet': 'parquet', '.json': 'json', '.jsonl': 'json'}
+    if path.is_file():
+        files = [path]
+    else:
+        # Downloaded dataset repositories commonly use data/test-*.parquet.
+        # Never fall back to all shards: that could mix test, train, and dev.
+        files = []
+        for root in (path, path / 'data'):
+            for suffix in formats:
+                files.extend(root.glob(f'{split}{suffix}'))
+                files.extend(root.glob(f'{split}-*{suffix}'))
+                files.extend(root.glob(f'{split}_*{suffix}'))
+                files.extend((root / split).glob(f'*{suffix}'))
+        files = sorted({file.resolve() for file in files if file.is_file()})
+    if not files:
+        raise ValueError(
+            f'No local {split!r} Parquet/JSON/JSONL files in {path}; '
+            'pass a dataset repository directory, a saved dataset, or a data file.'
+        )
+    kinds = {formats.get(file.suffix.lower()) for file in files}
+    if None in kinds or len(kinds) != 1:
+        raise ValueError('Use one local data format: Parquet or JSON/JSONL.')
+    kind = kinds.pop()
+    filenames = [str(file) for file in files]
+    ds = (Dataset.from_parquet(filenames) if kind == 'parquet'
+          else Dataset.from_json(filenames))
+    return ds, dict(format=kind, path=str(path), split=split, files=filenames)
+
+
 def load_prompts(args):
-    from datasets import DatasetDict, load_from_disk
-    ds = load_from_disk(args.dataset)
-    if isinstance(ds, DatasetDict):
-        ds = ds[args.split]
-    column = args.prompt_column
+    ds, source = load_local_split(args.dataset, args.split)
+    dataset_kind = getattr(args, 'dataset_kind', 'longswebench')
+    issue_only = getattr(args, 'issue_only', False)
+    if issue_only and (dataset_kind != 'swebench' or args.prompt_column):
+        raise ValueError('--issue-only requires SWE-Bench and no --prompt-column')
+    column = 'problem_statement' if issue_only else args.prompt_column
     if column is None:
         present = [key for key in ('text', 'prompt') if key in ds.column_names]
         if len(present) != 1:
+            if dataset_kind == 'swebench' and not present and 'problem_statement' in ds.column_names:
+                raise ValueError(
+                    'Raw SWE-Bench has issue text but no prepared code-context prompt. '
+                    'For the approximately 40K workload, use a local '
+                    'SWE-bench_bm25_40K dataset with a text column. '
+                    'Use --issue-only explicitly for short issue-only testing; '
+                    'this is not the 40K workload.'
+                )
             raise ValueError(f'Specify --prompt-column; available fields: {ds.column_names}')
         column = present[0]
+    if column not in ds.column_names:
+        raise ValueError(f'Column {column!r} not found; available fields: {ds.column_names}')
     prompts = list(ds[column])
     if not prompts or any(not isinstance(p, str) or not p.strip() for p in prompts):
         raise ValueError(f'{column} must contain nonempty strings')
-    info = dict(samples=len(prompts), column=column, fields=ds.column_names,
+    input_mode = 'issue_only' if column == 'problem_statement' else 'prepared_prompt'
+    info = dict(dataset_kind=dataset_kind, input_mode=input_mode, source=source,
+                samples=len(prompts), column=column, fields=ds.column_names,
                 sha256=hashlib.sha256(json.dumps(prompts, ensure_ascii=False).encode()).hexdigest(),
                 chat_template='none; dataset prompt sent verbatim, apart from optional unique prefix')
+    if dataset_kind == 'swebench' and input_mode == 'issue_only':
+        message = ('Issue-only SWE-Bench: no repository code context is included. '
+                   'These prompts are not the approximately 40K BM25 workload.')
+        info['warnings'] = [message]
+        warnings.warn(message, UserWarning, stacklevel=2)
     if args.tokenizer:
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(args.tokenizer, local_files_only=True,
@@ -224,7 +288,7 @@ def load_prompts(args):
         counts = [len(tok.encode(p, add_special_tokens=True)) for p in prompts]
         info['base_input_tokens'] = dict(min=min(counts), mean=statistics.mean(counts),
                                         p90=percentile(counts, .9), max=max(counts))
-        info['length_note'] = 'Source prompts are not truncated/padded to 131072 tokens. Unique prefix adds a few tokens; requests.jsonl records server prompt_tokens.'
+        info['length_note'] = 'Source prompts are not truncated or padded. Dataset length labels use the source tokenizer; local tokenizer counts can differ. Unique prefixes add a few tokens; requests.jsonl records server prompt_tokens.'
     return prompts, info
 
 
@@ -339,11 +403,13 @@ async def main_async(args, prompts, data_info):
         print('\nSUMMARY\n'+json.dumps(report, indent=2, ensure_ascii=False), flush=True)
 
 
-def parse_args():
+def parse_args(argv=None, *, dataset_kind='longswebench'):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--dataset', default=str(Path.home() / 'datasets/longswebench/LongSWE_Bench/128K'))
+    p.add_argument('--dataset-kind', choices=('longswebench', 'swebench'), default=dataset_kind)
+    p.add_argument('--dataset', help='Local saved dataset, Parquet/JSON/JSONL file, or dataset repository directory')
     p.add_argument('--split', default='test')
     p.add_argument('--prompt-column')
+    p.add_argument('--issue-only', action='store_true', help='Explicitly benchmark raw SWE-Bench problem_statement without code context; not a 40K workload')
     p.add_argument('--tokenizer', default='/mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-0731')
     p.add_argument('--trust-remote-code', action='store_true', help='Allow custom tokenizer Python from the local model directory')
     p.add_argument('--base-url', default='http://127.0.0.1:32073')
@@ -363,7 +429,13 @@ def parse_args():
     p.add_argument('--allow-prefix-reuse', action='store_true', help='Replay unchanged prompts; possible full-prefix hits on repeats')
     p.add_argument('--keep-cache', action='store_true', help='Do not flush between stages; changes cache-state policy')
     p.add_argument('--inspect-only', action='store_true', help='Read local data/tokenizer and exit without HTTP or output files')
-    a = p.parse_args()
+    a = p.parse_args(argv)
+    if a.dataset is None:
+        relative = ('swebench' if a.dataset_kind == 'swebench'
+                    else 'longswebench/LongSWE_Bench/128K')
+        a.dataset = str(Path.home() / 'datasets' / relative)
+    if a.issue_only and (a.dataset_kind != 'swebench' or a.prompt_column):
+        p.error('--issue-only requires SWE-Bench and no --prompt-column')
     a.base_url = a.base_url.rstrip('/')
     if not 1 <= a.start_concurrency <= a.max_concurrency:
         p.error('Require 1 <= start concurrency <= max concurrency')
@@ -375,9 +447,14 @@ def parse_args():
     return a
 
 
-if __name__ == '__main__':
-    args = parse_args()
+def cli_main(argv=None, *, dataset_kind='longswebench'):
+    args = parse_args(argv, dataset_kind=dataset_kind)
     prompts, data_info = load_prompts(args)
     print(json.dumps(data_info, indent=2, ensure_ascii=False), flush=True)
     if not args.inspect_only:
         asyncio.run(main_async(args, prompts, data_info))
+
+
+if __name__ == '__main__':
+    cli_main()
+
