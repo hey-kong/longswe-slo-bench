@@ -120,11 +120,18 @@ async def request(session, args, prompt, rid, max_tokens=None,
 
 
 async def flush_cache(session, args):
+    import aiohttp
+
+    # Wait for full scheduler idleness, including outstanding async operations.
+    # The HTTP deadline must exceed the server's wait; the session default is 30s.
+    server_wait_seconds = 60
+    http_timeout = aiohttp.ClientTimeout(total=server_wait_seconds + 15)
+    url = args.base_url + f'/flush_cache?timeout={server_wait_seconds}'
     # Older SGLang releases use GET, newer releases also support POST.
-    async with session.post(args.base_url+'/flush_cache') as response:
+    async with session.post(url, timeout=http_timeout) as response:
         code, text = response.status, await response.text()
     if code == 405:
-        async with session.get(args.base_url+'/flush_cache') as response:
+        async with session.get(url, timeout=http_timeout) as response:
             code, text = response.status, await response.text()
     if code != 200:
         raise RuntimeError(f'Cache flush failed: HTTP {code}: {text[:300]}')
