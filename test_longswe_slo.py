@@ -1,4 +1,5 @@
 """Timing regressions. No GPU, model, dataset, or running server required."""
+import asyncio
 import contextlib
 import io
 import json
@@ -9,6 +10,8 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 import longswe_slo as bench
 
 
@@ -233,6 +236,112 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
             report = await self.run_main(args, clock, stage)
         self.assertEqual(kinds, ['probe'])
         self.assertEqual(report['status'], 'INCONCLUSIVE')
+
+
+class FlushResponse:
+    def __init__(self, status=200, body='Cache flushed.'):
+        self.status = status
+        self.body = body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def text(self):
+        return self.body
+
+
+class CacheFlushTests(unittest.IsolatedAsyncioTestCase):
+    async def test_post_wait_outlives_the_session_default_timeout(self):
+        observed = []
+
+        async def flush(request):
+            observed.append((request.method, request.query.get('timeout')))
+            # Scaled regression: the response arrives after the session deadline.
+            await asyncio.sleep(.15)
+            return web.Response(text='Cache flushed.')
+
+        app = web.Application()
+        app.router.add_post('/flush_cache', flush)
+        async with TestServer(app) as server:
+            args = options(base_url=str(server.make_url('/')).rstrip('/'))
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=.03),
+            ) as session:
+                await bench.flush_cache(session, args)
+        self.assertEqual(observed, [('POST', '60')])
+
+    async def test_get_fallback_can_also_wait_past_the_session_default(self):
+        observed = []
+
+        async def flush(request):
+            observed.append((request.method, request.query.get('timeout')))
+            if request.method == 'POST':
+                return web.Response(status=405)
+            await asyncio.sleep(.15)
+            return web.Response(text='Cache flushed.')
+
+        app = web.Application()
+        app.router.add_route('*', '/flush_cache', flush)
+        async with TestServer(app) as server:
+            args = options(base_url=str(server.make_url('/')).rstrip('/'))
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=.03),
+            ) as session:
+                await bench.flush_cache(session, args)
+        self.assertEqual(observed, [('POST', '60'), ('GET', '60')])
+
+    async def test_both_methods_allow_more_time_than_the_server_wait(self):
+        session = Mock()
+        session.post.return_value = FlushResponse(status=405)
+        session.get.return_value = FlushResponse()
+
+        await bench.flush_cache(session, options())
+
+        for method in (session.post, session.get):
+            method.assert_called_once()
+            call = method.call_args
+            server_wait = float(call.args[0].split('timeout=')[1])
+            self.assertGreater(call.kwargs['timeout'].total, server_wait)
+
+    async def test_rejected_flush_prevents_generation(self):
+        session = Mock()
+        session.post.return_value = FlushResponse(status=400, body='Still busy')
+        clock = Clock()
+        generate = AsyncMock()
+
+        with (
+            patch.object(bench.time, 'perf_counter', clock.read),
+            patch.object(bench, 'request', new=generate),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'HTTP 400: Still busy'):
+                await bench.stage(
+                    session, options(), ['prompt'], 1, 10, 'probe',
+                    io.StringIO(), 'rejected', 10,
+                )
+        generate.assert_not_awaited()
+        session.get.assert_not_called()
+
+    async def test_flush_wait_does_not_extend_the_send_window(self):
+        clock = Clock()
+        generate = AsyncMock()
+
+        async def wait_for_idle(session, args):
+            clock.advance(11)
+
+        with (
+            patch.object(bench.time, 'perf_counter', clock.read),
+            patch.object(bench, 'flush_cache', side_effect=wait_for_idle),
+            patch.object(bench, 'request', new=generate),
+        ):
+            result = await bench.stage(
+                None, options(), ['prompt'], 1, 10, 'probe',
+                io.StringIO(), 'deadline', 10,
+            )
+        self.assertIsNone(result)
+        generate.assert_not_awaited()
 
 
 if __name__ == '__main__':
