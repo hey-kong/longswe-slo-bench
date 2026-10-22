@@ -44,8 +44,9 @@ All data and tokenizer files are loaded locally. Use `--prompt-column` if field 
 
 ## Test settings
 
-- 1,200-second search budget; concurrency starts at 8 and is capped at 64.
-- Doubling followed by binary search, with 180-second probes and at least 300 seconds reserved for confirmation. In-flight requests finish before each stage ends; draining may extend total wall time.
+- A 1,200-second request-send window starts after local data preparation and warmup. No new generation requests are initiated after the deadline. Already-sent requests finish normally afterward, so total wall time can exceed 20 minutes.
+- Concurrency starts at 8 and is capped at 64. Doubling and binary search use 180-second probes; `--confirm-seconds` reserves a target confirmation window, not a required minimum. Any remaining send time is used for confirmation, or to continue the last candidate if no probe passed.
+- Requests drain completely between stages without resetting the global clock. Errors stop the run early; existing per-request timeouts still apply. The former `--drain-reserve` option has been removed.
 - Fixed output length, temperature 0, and EOS ignored. Keep output length identical across configurations.
 - Mean decode TPS is the arithmetic mean of `(output_tokens - 1) / (E2E - TTFT)` per request, excluding TTFT.
 - Unique request prefixes prevent full-prefix reuse by default. Add `--allow-prefix-reuse` to replay unchanged prompts. Cache is flushed between stages unless `--keep-cache` is set.
@@ -53,8 +54,16 @@ All data and tokenizer files are loaded locally. Use `--prompt-column` if field 
 
 ## Results
 
-See `summary.json` for `confirmed_concurrency`, `smallest_observed_fail`, and per-stage metrics. `requests.jsonl` contains individual request measurements; `config.json` records settings and dataset details.
+See `summary.json` for `highest_passing_concurrency`, `confirmed_concurrency`, `smallest_observed_fail`, and per-stage metrics. A passing probe and a successful independent confirmation are reported separately; inconsistent PASS/FAIL observations are flagged. `requests.jsonl` contains individual request measurements; `config.json` records settings and dataset details.
 
-Errors and insufficient samples do not count as passing. Results identify the highest tested, reconfirmed candidate—not proof of the global maximum or a full 20-minute run at that concurrency.
+Errors and insufficient samples do not count as passing. Results are observations within the send window, not proof of the global maximum or a full 20-minute run at one concurrency. Timing fields include `send_window_seconds`, `last_request_started_elapsed_s`, `final_drain_seconds`, and `elapsed_wall_seconds`.
 
 Run `python longswe_slo.py --help` for all options.
+
+## Timing checks
+
+CPU-only mocked checks require no model, dataset, or running server:
+
+```bash
+python -m unittest -v test_longswe_slo.py
+```

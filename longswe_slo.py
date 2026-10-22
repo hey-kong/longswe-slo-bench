@@ -49,7 +49,8 @@ def summarize(rows, args):
                 error_examples=[r.get('error') for r in rows if not r['ok']][:3])
 
 
-async def request(session, args, prompt, rid, max_tokens=None):
+async def request(session, args, prompt, rid, max_tokens=None,
+                  admission_deadline=None, benchmark_start=None):
     length = args.output_len if max_tokens is None else max_tokens
     start = time.perf_counter()
     record = dict(rid=rid, ok=False, ttft_s=None, e2e_s=None,
@@ -64,6 +65,11 @@ async def request(session, args, prompt, rid, max_tokens=None):
                                             ignore_eos=True, stop=[], stop_token_ids=[]))
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=args.request_timeout)
+        admitted_at = time.perf_counter()
+        if admission_deadline is not None and admitted_at >= admission_deadline:
+            return None  # Not sent; do not record this as a failed request.
+        if benchmark_start is not None:
+            record['admitted_elapsed_s'] = admitted_at - benchmark_start
         async with session.post(args.base_url+'/generate', json=payload, timeout=timeout) as response:
             if response.status != 200:
                 raise RuntimeError(f'HTTP {response.status}: {(await response.text())[:300]}')
@@ -130,11 +136,14 @@ async def flush_cache(session, args):
         raise RuntimeError(f'Cache flush rejected: {text[:300]}')
 
 
-async def stage(session, args, prompts, c, seconds, kind, raw_file, run_id, deadline):
+async def stage(session, args, prompts, c, seconds, kind, raw_file, run_id, deadline,
+                benchmark_start=None):
+    if time.perf_counter() >= deadline:
+        return None
     if not args.keep_cache:
         await flush_cache(session, args)
     start = time.perf_counter()
-    admission_end = min(start + seconds, deadline - args.drain_reserve)
+    admission_end = min(start + seconds, deadline)
     if admission_end <= start:
         return None
     rows = []
@@ -156,7 +165,11 @@ async def stage(session, args, prompts, c, seconds, kind, raw_file, run_id, dead
                 # Distinct FIRST tokens prevent repeated full-context cache hits.
                 salt = hashlib.sha256(rid.encode()).hexdigest()
                 prompt = f'<!-- benchmark-request {salt} -->\n' + prompt
-            row = await request(session, args, prompt, rid)
+            row = await request(session, args, prompt, rid,
+                                admission_deadline=admission_end,
+                                benchmark_start=benchmark_start)
+            if row is None:
+                break
             row.update(kind=kind, concurrency=c, sample_index=sample,
                        stage_elapsed_s=time.perf_counter()-start)
             rows.append(row)
@@ -166,11 +179,16 @@ async def stage(session, args, prompts, c, seconds, kind, raw_file, run_id, dead
                 # Do not repeatedly hammer an invalid/failed endpoint.
                 return
 
+    # Stop admitting at admission_end, but never cancel requests at that boundary.
     await asyncio.gather(*(worker() for _ in range(c)))
+    finished_at = time.perf_counter()
     result = summarize(rows, args)
     result.update(kind=kind, concurrency=c,
                   admission_seconds=admission_end-start,
-                  wall_seconds=time.perf_counter()-start)
+                  wall_seconds=finished_at-start,
+                  drain_seconds=max(0.0, finished_at-admission_end),
+                  last_request_started_elapsed_s=max(
+                      (r.get('admitted_elapsed_s', 0.0) for r in rows), default=None))
     print(json.dumps(result, ensure_ascii=False), flush=True)
     return result
 
@@ -231,19 +249,22 @@ async def main_async(args, prompts, data_info):
         with (out/'requests.jsonl').open('w', buffering=1) as raw:
             while True:
                 remaining = deadline-time.perf_counter()
-                # Reserve a full confirmation window plus final drain. Probes drain
-                # naturally; long requests may consume this reserve, which is reported.
-                reserve = args.confirm_seconds + args.drain_reserve
-                if remaining < reserve + args.probe_seconds + args.drain_reserve:
+                # Reserve a target confirmation window, not time for final draining.
+                # Each probe drains before the next stage, within the send-window clock.
+                if remaining < args.confirm_seconds + args.probe_seconds:
                     break
                 r = await stage(session, args, prompts, candidate, args.probe_seconds,
-                                'probe', raw, run_id, deadline)
+                                'probe', raw, run_id, deadline, benchmark_start=start)
                 if r is None:
                     break
                 results.append(r)
                 (out/'stages.json').write_text(json.dumps(results, indent=2))
-                if r['status'] in ('ERROR', 'INSUFFICIENT'):
-                    stop_reason = 'invalid_probe_'+r['status'].lower()
+                if r['status'] == 'ERROR':
+                    stop_reason = 'invalid_probe_error'
+                    break
+                if r['status'] == 'INSUFFICIENT':
+                    # Use the remaining window at this concurrency for more evidence.
+                    stop_reason = 'probe_insufficient_samples'
                     break
                 if r['status'] == 'PASS':
                     low = max(low, candidate)
@@ -259,24 +280,53 @@ async def main_async(args, prompts, data_info):
                     candidate = (low+high)//2
                 else:
                     candidate = min(args.max_concurrency, candidate*2)
-            if low and not stop_reason.startswith('invalid_probe_'):
-                remaining = deadline-time.perf_counter()-args.drain_reserve
-                if remaining >= args.confirm_seconds:
-                    r = await stage(session, args, prompts, low, remaining,
-                                    'confirm', raw, run_id, deadline)
+            if stop_reason != 'invalid_probe_error':
+                remaining = deadline-time.perf_counter()
+                if remaining > 0:
+                    # Confirmation has no minimum duration. If no probe passed,
+                    # continue the last candidate rather than ending the run early.
+                    final_c = low or candidate
+                    final_kind = 'confirm' if low else 'continue'
+                    r = await stage(session, args, prompts, final_c, remaining,
+                                    final_kind, raw, run_id, deadline,
+                                    benchmark_start=start)
                     if r:
                         results.append(r)
-                        if r['status'] == 'PASS':
+                        (out/'stages.json').write_text(json.dumps(results, indent=2))
+                        if final_kind == 'confirm' and r['status'] == 'PASS':
                             confirmed = low
-                else:
-                    stop_reason += '; insufficient_confirmation_time'
+        passed = {r['concurrency'] for r in results if r['status'] == 'PASS'}
+        failed = {r['concurrency'] for r in results if r['status'] == 'FAIL'}
+        inconsistent = sorted(passed & failed)
+        has_errors = any(r['status'] == 'ERROR' for r in results)
+        if inconsistent:
+            confirmed = None
+            status = 'INCONSISTENT'
+        elif has_errors:
+            confirmed = None
+            status = 'INCONCLUSIVE'
+        elif confirmed is not None:
+            status = 'CONFIRMED_CANDIDATE'
+        elif passed:
+            status = 'PASSING_CANDIDATE'
+        else:
+            status = 'INCONCLUSIVE'
+        elapsed = time.perf_counter()-start
+        last_starts = [r['last_request_started_elapsed_s'] for r in results
+                       if r.get('last_request_started_elapsed_s') is not None]
         report = dict(label=args.label, best_probe_concurrency=low or None,
-                      confirmed_concurrency=confirmed, smallest_observed_fail=high,
+                      highest_passing_concurrency=max(passed) if passed else None,
+                      confirmed_concurrency=confirmed,
+                      smallest_observed_fail=min(failed) if failed else None,
+                      inconsistent_concurrencies=inconsistent,
                       tested_upper_cap=args.max_concurrency,
-                      status=('CONFIRMED_CANDIDATE' if confirmed else 'INCONCLUSIVE'),
+                      status=status,
                       stop_reason=stop_reason, budget_seconds=args.budget_seconds,
-                      elapsed_wall_seconds=time.perf_counter()-start,
-                      note='Largest tested passing candidate, not proof of global maximum or 20-minute stability at a single concurrency.',
+                      send_window_seconds=args.budget_seconds,
+                      last_request_started_elapsed_s=max(last_starts) if last_starts else None,
+                      final_drain_seconds=max(0.0, elapsed-args.budget_seconds),
+                      elapsed_wall_seconds=elapsed,
+                      note='No new generation requests after the send-window deadline; in-flight requests drain afterward. Passing candidates are observed results, not proof of the global maximum.',
                       stages=results)
         (out/'summary.json').write_text(json.dumps(report, indent=2, ensure_ascii=False))
         print('\nSUMMARY\n'+json.dumps(report, indent=2, ensure_ascii=False), flush=True)
@@ -293,10 +343,9 @@ def parse_args():
     p.add_argument('--label', default='run')
     p.add_argument('--output-dir', required=True, help='Must not exist')
     p.add_argument('--output-len', type=int, required=True, help='Agree on this before comparing results; fixed output, ignore EOS')
-    p.add_argument('--budget-seconds', type=float, default=1200)
+    p.add_argument('--budget-seconds', type=float, default=1200, help='Total send-window seconds after preparation and warmup; final draining is extra')
     p.add_argument('--probe-seconds', type=float, default=180)
-    p.add_argument('--confirm-seconds', type=float, default=300)
-    p.add_argument('--drain-reserve', type=float, default=90, help='Stop new requests this long before total deadline; no truncation of in-flight requests')
+    p.add_argument('--confirm-seconds', type=float, default=300, help='Target time to reserve for confirmation; not a required minimum')
     p.add_argument('--request-timeout', type=float, default=300)
     p.add_argument('--start-concurrency', type=int, default=8)
     p.add_argument('--max-concurrency', type=int, default=64)
@@ -313,7 +362,7 @@ def parse_args():
         p.error('Require 1 <= start concurrency <= max concurrency')
     if a.output_len < 2 or a.min_completed < 1:
         p.error('Require output_len >= 2 and min_completed >= 1')
-    for key in ('budget_seconds', 'probe_seconds', 'confirm_seconds', 'drain_reserve', 'request_timeout', 'ttft_slo', 'tps_slo'):
+    for key in ('budget_seconds', 'probe_seconds', 'confirm_seconds', 'request_timeout', 'ttft_slo', 'tps_slo'):
         if getattr(a, key) <= 0:
             p.error(f'{key} must be positive')
     return a
