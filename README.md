@@ -1,4 +1,4 @@
-# LongSWE / SWE SLO Bench
+# SWE SLO Bench
 
 Search for the highest tested client concurrency satisfying **P90 TTFT < 10 s** and **mean decode TPS > 15 tokens/s**, using local LongSWE-Bench or SWE-Bench prompts and an already running SGLang server. Both entry points share the same requests, metrics, search, and time budget.
 
@@ -7,8 +7,8 @@ Search for the highest tested client concurrency satisfying **P90 TTFT < 10 s** 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then:
 
 ```bash
-git clone https://github.com/hey-kong/longswe-slo-bench.git
-cd longswe-slo-bench
+git clone https://github.com/hey-kong/swe-slo-bench.git
+cd swe-slo-bench
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -r requirements.txt
